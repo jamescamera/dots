@@ -143,7 +143,7 @@
 
   <main class="stage">
     <div class="empty" id="empty">
-      <p>Open a photograph to begin. A close portrait works best.</p>
+      <p>Open a photograph to begin. Anything with a face in it will do.</p>
       <button class="solid" id="open2" style="font:inherit;font-size:14px;padding:10px 16px;border:0;border-radius:2px;background:var(--bone);color:var(--ground);cursor:pointer">Choose a file</button>
     </div>
     <canvas id="out"></canvas>
@@ -154,7 +154,7 @@
       <h1>Stitched</h1>
       <span>after the punched-photograph embroideries</span>
     </div>
-    <p class="lede">Circles are cut out of the photograph and threaded back together above it, rearranged into a small portrait of whoever is in the picture. This version uses colour-aware matching for a clearer reconstruction.</p>
+    <p class="lede">Circles are cut out of the photograph and threaded back together above it, rearranged into a small portrait of whoever is in the picture. It finds the face on its own, and cuts the circles it is going to need.</p>
 
     <nav class="tabs" role="tablist">
       <button role="tab" aria-selected="true" data-tab="portrait">Portrait</button>
@@ -229,7 +229,7 @@
       <button id="shuffle" disabled>Repunch</button>
       <button id="save" disabled>Save image</button>
     </div>
-    <p class="note">Tap the face you want rebuilt — the outline shows what is being copied. This version matches by colour, tone, detail and approximate position, so the rebuilt portrait should read more clearly.</p>
+    <p class="note">Tap the face you want rebuilt — the outline shows what is being copied. Holes are punched to supply the colours the small portrait asks for, so a wide shot or a strong background no longer swallows the face.</p>
   </aside>
 
 </div>
@@ -254,7 +254,7 @@
   var state = {
     img:null, toned:null, analysis:null, aw:0, ah:0,
     auto:[], manual:[],
-    count:220, dotR:16, pack:1.0, lift:0.55, thread:0.45,
+    count:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
     cropSize:0.46, cropX:0.5, cropY:0.34,
     shape:'oval', tone:'sepia', edge:'deckle', mode:'portrait',
     seed:1, guides:true, layout:null
@@ -291,11 +291,13 @@
     tc.filter = 'none';
     state.toned = toned;
 
+    // Read the untoned pixels: sepia pulls every hue towards brown, and the
+    // matching needs true colour to tell a face from what is behind it.
     var aw = 220, ah = Math.max(2, Math.round(aw*sh/sw));
     var a = document.createElement('canvas');
     a.width = aw; a.height = ah;
     var ac = a.getContext('2d');
-    ac.drawImage(toned,0,0,aw,ah);
+    ac.drawImage(img,0,0,aw,ah);
     state.analysis = ac.getImageData(0,0,aw,ah).data;
     state.aw = aw; state.ah = ah;
   }
@@ -332,29 +334,119 @@
     return { pw:pw, ph:Math.round(pw*state.toned.height/state.toned.width) };
   }
 
+  /* ---------- finding the face ---------- */
+
+  // Skin sits in a narrow band where red leads green leads blue by a little,
+  // which holds across complexions; it is enough to tell a head from a wall.
+  function skinAt(i){
+    var d = state.analysis;
+    var r = d[i]/255, g = d[i+1]/255, b = d[i+2]/255;
+    var mx = Math.max(r,g,b), mn = Math.min(r,g,b);
+    if (mx < 0.12 || mn > 0.94) return false;
+    if (mx - mn < 0.045) return false;
+    if (r <= g || g < b - 0.02) return false;
+    var rg = r - g;
+    if (rg < 0.02 || rg > 0.34) return false;
+    if (g - b > 0.30) return false;
+    return true;
+  }
+
+  // The crop decides everything downstream, so aim it at the face instead of at
+  // a fixed spot that only suits a tightly framed portrait.
+  function autoCrop(){
+    var aw = state.aw, ah = state.ah, xs = [], ys = [];
+    for (var y=0;y<ah;y++){
+      for (var x=0;x<aw;x++){
+        if (skinAt((y*aw+x)*4)){ xs.push(x); ys.push(y); }
+      }
+    }
+    if (xs.length < aw*ah*0.004) return;   // nothing face-like: keep the defaults
+    xs.sort(function(a,b){ return a-b; });
+    ys.sort(function(a,b){ return a-b; });
+    function pct(arr,q){ return arr[clamp(Math.round((arr.length-1)*q),0,arr.length-1)]; }
+    var x0 = pct(xs,0.06), x1 = pct(xs,0.94);
+    var y0 = pct(ys,0.06), y1 = pct(ys,0.94);
+    var fw = Math.max(1, x1-x0), fh = Math.max(1, y1-y0);
+
+    // Open out past the bare skin so hair and jaw come along, but not so far
+    // that the head is lost in the room behind it.
+    var w = clamp(Math.max(fw*1.45, fh*0.93)/aw, 0.12, 0.90);
+    var h = w*1.24*(aw/ah);
+    state.cropSize = w;
+    state.cropX = clamp((x0+x1)/2/aw, 0, 1);
+    state.cropY = clamp((y0+y1)/2/ah - h*0.14, 0, 1);
+  }
+
+  // The pieces have to be cut from somewhere. When the head is small in the
+  // frame there is not enough of it to punch this many circles out of, and the
+  // rebuilt portrait ends up made of whatever was standing behind them; smaller
+  // circles buy back the supply.
+  function autoHoleSize(){
+    var m = photoMetrics();
+    var w = state.cropSize*m.pw, h = Math.min(w*1.24, m.ph*0.98);
+    var spacing = Math.sqrt(w*h*0.55/state.count);
+    state.dotR = clamp(Math.round(Math.min(state.dotPref, spacing/1.28)), 8, 40);
+  }
+
   /* ---------- punching ---------- */
+
+  function colorBin(r,g,b){
+    return clamp(Math.floor(r*5),0,4)*25 + clamp(Math.floor(g*5),0,4)*5 + clamp(Math.floor(b*5),0,4);
+  }
+
+  // What the little portrait will ask for, colour by colour. Punching to match
+  // this is what stops a big flat background from eating the supply and leaving
+  // skin slots with nothing but sky to fill them.
+  function colorDemand(M){
+    var slots = hexSlots(M).slots, demand = new Array(125).fill(0);
+    for (var i=0;i<slots.length;i++) demand[colorBin(slots[i].r,slots[i].g,slots[i].b)]++;
+    return demand;
+  }
 
   function generatePoints(){
     var m = photoMetrics();
     var rand = rng(state.seed*7919 + state.count*13 + state.dotR);
-    var pts = [], minD = (state.dotR*1.28)/m.pw, aspect = m.ph/m.pw;
-    var BANDS = 8, quota = Math.ceil(state.count/BANDS*1.35);
-    var bands = new Array(BANDS).fill(0);
-    var relaxAt = state.count*160, tries = 0, maxTries = state.count*520;
+    var minD = (state.dotR*1.28)/m.pw, aspect = m.ph/m.pw;
+
+    var demand = colorDemand(state.count);
+    var quota = demand.map(function(d){ return d ? Math.ceil(d*1.35)+1 : 0; });
+    var filled = new Array(125).fill(0);
+
+    // Hash grid, so the spacing test stays cheap at six hundred holes.
+    var cell = Math.max(minD, 1e-4), grid = {};
+    function key(u,v){ return Math.floor(u/cell)+','+Math.floor(v*aspect/cell); }
+    function fits(u,v){
+      var cx = Math.floor(u/cell), cy = Math.floor(v*aspect/cell);
+      for (var i=cx-1;i<=cx+1;i++){
+        for (var j=cy-1;j<=cy+1;j++){
+          var b = grid[i+','+j]; if (!b) continue;
+          for (var k=0;k<b.length;k++){
+            var dx = b[k].u-u, dy = (b[k].v-v)*aspect;
+            if (dx*dx+dy*dy < minD*minD) return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    var pts = [], tries = 0;
+    var dropDetail = state.count*80, dropQuota = state.count*260, maxTries = state.count*900;
 
     while (pts.length < state.count && tries < maxTries){
       tries++;
-      var u = rand(), v = rand(), relaxed = tries > relaxAt;
-      if (!relaxed && rand() > 0.2 + detailAt(u,v)*0.85) continue;
-      var b = clamp(Math.floor(lumAt(u,v)*BANDS),0,BANDS-1);
-      if (!relaxed && bands[b] >= quota) continue;
-      var ok = true;
-      for (var i=0;i<pts.length;i++){
-        var dx = pts[i].u-u, dy = (pts[i].v-v)*aspect;
-        if (dx*dx+dy*dy < minD*minD){ ok=false; break; }
+      var u = rand(), v = rand();
+      if (tries < dropDetail && rand() > 0.24 + detailAt(u,v)*0.76) continue;
+      var bin = -1;
+      if (tries < dropQuota){
+        var c = rgbAt(u,v);
+        bin = colorBin(c[0],c[1],c[2]);
+        if (filled[bin] >= quota[bin]) continue;
       }
-      if (!ok) continue;
-      bands[b]++; pts.push({u:u,v:v});
+      if (!fits(u,v)) continue;
+      if (bin >= 0) filled[bin]++;
+      var p = {u:u,v:v}, k = key(u,v);
+      pts.push(p);
+      (grid[k] || (grid[k] = [])).push(p);
     }
     state.auto = pts;
   }
@@ -468,7 +560,7 @@
     });
 
     var used = new Array(pts.length).fill(false);
-    var pairs = [];
+    var taken = [];
 
     slots.forEach(function(slot){
       var best = -1, bestScore = 1e9;
@@ -490,14 +582,33 @@
       }
       if (best >= 0){
         used[best] = true;
-        var p = pts[best];
-        pairs.push({
-          u:p.u, v:p.v,
-          tx:L.cx+slot.x, ty:L.cy+slot.y,
-          lum:slot.lum,
-          detail:slot.detail
-        });
+        taken.push({slot:slot, i:best, sc:bestScore});
       }
+    });
+
+    // Greedy commits early and strands good pieces on slots that barely wanted
+    // them. A bounded round of swaps buys the worst of those back, far cheaper
+    // than solving the assignment properly.
+    var swapRand = rng(state.seed*104729 + taken.length*31 + 7);
+    var m = taken.length, rounds = Math.min(40000, m*24);
+    for (var it=0; it<rounds; it++){
+      var a = taken[Math.floor(swapRand()*m)], b = taken[Math.floor(swapRand()*m)];
+      if (a === b) continue;
+      var sa = score(pts[b.i], a.slot), sb = score(pts[a.i], b.slot);
+      if (sa + sb < a.sc + b.sc - 1e-6){
+        var t = a.i; a.i = b.i; b.i = t;
+        a.sc = sa; b.sc = sb;
+      }
+    }
+
+    var pairs = taken.map(function(x){
+      var p = pts[x.i];
+      return {
+        u:p.u, v:p.v,
+        tx:L.cx+x.slot.x, ty:L.cy+x.slot.y,
+        lum:x.slot.lum,
+        detail:x.slot.detail
+      };
     });
 
     // Draw lower-detail pieces first so the denser facial detail sits on top.
@@ -700,6 +811,9 @@
       state.img = img;
       prepareSource(img);
       state.manual = [];
+      autoCrop();
+      autoHoleSize();
+      syncUI();
       generatePoints();
       animate();
       ['save','shuffle','stitch'].forEach(function(id){
@@ -721,6 +835,20 @@
     el.style.setProperty('--p', pct.toFixed(1)+'%');
   }
 
+  // Push framing chosen for the photograph back onto the controls, so the
+  // sliders keep telling the truth about what is on screen.
+  function syncUI(){
+    var crop = document.getElementById('crop');
+    crop.value = Math.round(state.cropSize*100);
+    fill(crop);
+    document.getElementById('cropVal').textContent = state.cropSize.toFixed(2);
+
+    var size = document.getElementById('size');
+    size.value = state.dotR;
+    fill(size);
+    document.getElementById('sizeVal').textContent = state.dotR;
+  }
+
   function slider(id, valId, apply, fmt, regen){
     var el = document.getElementById(id), out = document.getElementById(valId);
     fill(el);
@@ -736,7 +864,7 @@
   slider('crop','cropVal',  function(v){ state.cropSize=v/100; }, function(){ return state.cropSize.toFixed(2); }, false);
   slider('pack','packVal',  function(v){ state.pack=v/100; },     function(){ return state.pack.toFixed(2); }, false);
   slider('count','countVal',function(v){ state.count=v; },        function(){ return state.count; }, true);
-  slider('size','sizeVal',  function(v){ state.dotR=v; },         function(){ return state.dotR; }, true);
+  slider('size','sizeVal',  function(v){ state.dotR=v; state.dotPref=v; }, function(){ return state.dotR; }, true);
   slider('thread','threadVal',function(v){ state.thread=v/100; }, function(){ return state.thread.toFixed(2); }, false);
   slider('lift','liftVal',  function(v){ state.lift=v/100; },     function(){ return state.lift.toFixed(2); }, false);
 
