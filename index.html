@@ -229,7 +229,7 @@
       <button id="shuffle" disabled>Repunch</button>
       <button id="save" disabled>Save image</button>
     </div>
-    <p class="note">Tap the face you want rebuilt — the outline shows what is being copied. Holes are punched to supply the colours the small portrait asks for, so a wide shot or a strong background no longer swallows the face.</p>
+    <p class="note">The face is found on opening, and the holes are then punched to supply the colours that portrait asks for. On a busy or strongly lit scene it may not find one — tap the head to aim the outline yourself and pull Crop in around it, and the circles will resize to suit.</p>
   </aside>
 
 </div>
@@ -254,7 +254,7 @@
   var state = {
     img:null, toned:null, analysis:null, aw:0, ah:0,
     auto:[], manual:[],
-    count:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
+    count:220, countPref:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
     cropSize:0.46, cropX:0.5, cropY:0.34,
     shape:'oval', tone:'sepia', edge:'deckle', mode:'portrait',
     seed:1, guides:true, layout:null
@@ -293,7 +293,7 @@
 
     // Read the untoned pixels: sepia pulls every hue towards brown, and the
     // matching needs true colour to tell a face from what is behind it.
-    var aw = 220, ah = Math.max(2, Math.round(aw*sh/sw));
+    var aw = 400, ah = Math.max(2, Math.round(aw*sh/sw));
     var a = document.createElement('canvas');
     a.width = aw; a.height = ah;
     var ac = a.getContext('2d');
@@ -337,55 +337,146 @@
   /* ---------- finding the face ---------- */
 
   // Skin sits in a narrow band where red leads green leads blue by a little,
-  // which holds across complexions; it is enough to tell a head from a wall.
-  function skinAt(i){
-    var d = state.analysis;
-    var r = d[i]/255, g = d[i+1]/255, b = d[i+2]/255;
-    var mx = Math.max(r,g,b), mn = Math.min(r,g,b);
-    if (mx < 0.12 || mn > 0.94) return false;
-    if (mx - mn < 0.045) return false;
-    if (r <= g || g < b - 0.02) return false;
-    var rg = r - g;
-    if (rg < 0.02 || rg > 0.34) return false;
-    if (g - b > 0.30) return false;
-    return true;
+  // which holds across complexions. Balance is the difficulty: read the pixels
+  // as shot and a sepia print or a sunlit brick wall is skin from edge to edge;
+  // balance the frame to grey first and a face filling the frame becomes the
+  // grey it is measured against. Neither reading is right on its own, so both
+  // get built and the candidates are judged together.
+  function skinMask(balanced){
+    var d = state.analysis, n = state.aw*state.ah;
+    var kr = 1, kg = 1, kb = 1;
+    if (balanced){
+      var sr=0, sg=0, sb=0;
+      for (var i=0;i<n;i++){ sr+=d[i*4]; sg+=d[i*4+1]; sb+=d[i*4+2]; }
+      var avg = (sr+sg+sb)/(3*n) || 1;
+      kr = avg/Math.max(1,sr/n); kg = avg/Math.max(1,sg/n); kb = avg/Math.max(1,sb/n);
+    }
+    var mask = new Uint8Array(n);
+    for (var j=0;j<n;j++){
+      var r = d[j*4]*kr/255, g = d[j*4+1]*kg/255, b = d[j*4+2]*kb/255;
+      var mx = Math.max(r,g,b), mn = Math.min(r,g,b);
+      if (mx < 0.14 || mn > 0.95) continue;
+      if (mx - mn < 0.045) continue;
+      if (r <= g || g < b - 0.02) continue;
+      var rg = r - g;
+      if (rg < 0.03 || rg > 0.34) continue;
+      if (g - b > 0.30) continue;
+      mask[j] = 1;
+    }
+    return mask;
+  }
+
+  // How red a rectangle runs, as shot.
+  function warmth(x0,y0,x1,y1){
+    var d = state.analysis, aw = state.aw, ah = state.ah, sum = 0, n = 0;
+    for (var y=Math.max(0,y0); y<=Math.min(ah-1,y1); y++){
+      for (var x=Math.max(0,x0); x<=Math.min(aw-1,x1); x++){
+        var i = (y*aw+x)*4;
+        sum += (d[i] - d[i+1])/255; n++;
+      }
+    }
+    return {sum:sum, n:n};
+  }
+
+  // Brick, sand and floorboards come in warm patches too, but they sit in a
+  // field of themselves and fade off in the direction of the light. A head is
+  // hemmed in: hair above, a jaw and a collar below, background either side.
+  // So ask each side separately and keep the weakest answer — a wall lit from
+  // one end fails on the end it is lit from.
+  function standsOut(x0,y0,x1,y1){
+    var padX = Math.max(3, Math.round((x1-x0)*0.7));
+    var padY = Math.max(3, Math.round((y1-y0)*0.7));
+    var inner = warmth(x0,y0,x1,y1);
+    if (!inner.n) return 0;
+    var mid = inner.sum/inner.n;
+    var sides = [
+      warmth(x0, y0-padY, x1, y0-1),        // above
+      warmth(x0, y1+1, x1, y1+padY),        // below
+      warmth(x0-padX, y0, x0-1, y1),        // left
+      warmth(x1+1, y0, x1+padX, y1)         // right
+    ];
+    var worst = 1;
+    for (var i=0;i<sides.length;i++){
+      // A side running off the edge of the photograph cannot vouch for anything.
+      if (sides[i].n < 6) return 0;
+      var diff = mid - sides[i].sum/sides[i].n;
+      if (diff < worst) worst = diff;
+    }
+    return worst;
+  }
+
+  // A head is a compact blob of its own, and it stands out from what is behind
+  // it. Walk each mask, keep the piece that behaves like one, and leave the
+  // scenery alone however warm the light on it was.
+  function faceBox(){
+    var aw = state.aw, ah = state.ah, n = aw*ah, best = null;
+
+    [skinMask(false), skinMask(true)].forEach(function(mask){
+      var seen = new Uint8Array(n), stack = [];
+      for (var s=0;s<n;s++){
+        if (!mask[s] || seen[s]) continue;
+        var x0=aw, x1=-1, y0=ah, y1=-1, area=0;
+        stack.length = 0; stack.push(s); seen[s] = 1;
+        while (stack.length){
+          var q = stack.pop(), qx = q%aw, qy = (q-qx)/aw;
+          area++;
+          if (qx<x0) x0=qx;
+          if (qx>x1) x1=qx;
+          if (qy<y0) y0=qy;
+          if (qy>y1) y1=qy;
+          if (qx>0    && mask[q-1]  && !seen[q-1]) { seen[q-1]=1;  stack.push(q-1); }
+          if (qx<aw-1 && mask[q+1]  && !seen[q+1]) { seen[q+1]=1;  stack.push(q+1); }
+          if (qy>0    && mask[q-aw] && !seen[q-aw]){ seen[q-aw]=1; stack.push(q-aw); }
+          if (qy<ah-1 && mask[q+aw] && !seen[q+aw]){ seen[q+aw]=1; stack.push(q+aw); }
+        }
+        if (area < Math.max(16, n*0.0004) || area > n*0.55) continue;
+        var bw = x1-x0+1, bh = y1-y0+1;
+        if (bw < 4 || bh < 4) continue;
+        var fill = area/(bw*bh);
+        if (fill < 0.42) continue;                       // scattered texture, not a face
+        var ratio = bw/bh;
+        if (ratio < 0.4 || ratio > 1.7) continue;        // not head-shaped
+
+        var stands = standsOut(x0,y0,x1,y1);
+        if (stands < 0.02) continue;
+
+        var shape = 1 - Math.abs(Math.log(ratio/0.78))*0.5;
+        var score = area * fill * shape * clamp(stands/0.05, 0.4, 1.8);
+        if (!best || score > best.score) best = {score:score, x0:x0, x1:x1, y0:y0, y1:y1};
+      }
+    });
+    return best;
   }
 
   // The crop decides everything downstream, so aim it at the face instead of at
   // a fixed spot that only suits a tightly framed portrait.
   function autoCrop(){
-    var aw = state.aw, ah = state.ah, xs = [], ys = [];
-    for (var y=0;y<ah;y++){
-      for (var x=0;x<aw;x++){
-        if (skinAt((y*aw+x)*4)){ xs.push(x); ys.push(y); }
-      }
-    }
-    if (xs.length < aw*ah*0.004) return;   // nothing face-like: keep the defaults
-    xs.sort(function(a,b){ return a-b; });
-    ys.sort(function(a,b){ return a-b; });
-    function pct(arr,q){ return arr[clamp(Math.round((arr.length-1)*q),0,arr.length-1)]; }
-    var x0 = pct(xs,0.06), x1 = pct(xs,0.94);
-    var y0 = pct(ys,0.06), y1 = pct(ys,0.94);
-    var fw = Math.max(1, x1-x0), fh = Math.max(1, y1-y0);
+    var box = faceBox();
+    if (!box) return;                      // nothing head-shaped: keep the defaults
+    var aw = state.aw, ah = state.ah;
+    var fw = box.x1-box.x0+1, fh = box.y1-box.y0+1;
 
     // Open out past the bare skin so hair and jaw come along, but not so far
     // that the head is lost in the room behind it.
-    var w = clamp(Math.max(fw*1.45, fh*0.93)/aw, 0.12, 0.90);
+    var w = clamp(Math.max(fw*1.45, fh*0.93)/aw, 0.10, 0.90);
     var h = w*1.24*(aw/ah);
     state.cropSize = w;
-    state.cropX = clamp((x0+x1)/2/aw, 0, 1);
-    state.cropY = clamp((y0+y1)/2/ah - h*0.14, 0, 1);
+    state.cropX = clamp((box.x0+box.x1)/2/aw, 0, 1);
+    state.cropY = clamp((box.y0+box.y1)/2/ah - h*0.14, 0, 1);
   }
 
-  // The pieces have to be cut from somewhere. When the head is small in the
-  // frame there is not enough of it to punch this many circles out of, and the
-  // rebuilt portrait ends up made of whatever was standing behind them; smaller
-  // circles buy back the supply.
+  // The pieces have to be cut from somewhere. Someone standing at the end of a
+  // street is a few hundred pixels of person, and there is not enough of them
+  // to punch two hundred circles out of: the portrait ends up made of whatever
+  // they were standing in front of. Smaller circles buy back some supply, and
+  // past that the honest answer is fewer of them.
   function autoHoleSize(){
     var m = photoMetrics();
     var w = state.cropSize*m.pw, h = Math.min(w*1.24, m.ph*0.98);
-    var spacing = Math.sqrt(w*h*0.55/state.count);
+    var spacing = Math.sqrt(w*h*0.55/state.countPref);
     state.dotR = clamp(Math.round(Math.min(state.dotPref, spacing/1.28)), 8, 40);
+    var d = state.dotR*1.28;
+    state.count = clamp(Math.round(Math.min(state.countPref, w*h*0.55/(d*d))/10)*10, 40, 600);
   }
 
   /* ---------- punching ---------- */
@@ -847,9 +938,24 @@
     size.value = state.dotR;
     fill(size);
     document.getElementById('sizeVal').textContent = state.dotR;
+
+    var count = document.getElementById('count');
+    count.value = state.count;
+    fill(count);
+    document.getElementById('countVal').textContent = state.count;
   }
 
-  function slider(id, valId, apply, fmt, regen){
+  // Re-cutting the framing by hand changes what the portrait is asking for, so
+  // the pieces have to be re-sized to suit it, exactly as on opening a photo.
+  function reframe(){
+    if (!state.toned) return;
+    autoHoleSize();
+    syncUI();
+    generatePoints();
+    render();
+  }
+
+  function slider(id, valId, apply, fmt, regen, after){
     var el = document.getElementById(id), out = document.getElementById(valId);
     fill(el);
     el.addEventListener('input', function(){
@@ -857,13 +963,14 @@
       apply(parseFloat(el.value));
       out.textContent = fmt();
       if (!state.toned) return;
+      if (after){ after(); return; }
       if (regen) generatePoints();
       render();
     });
   }
-  slider('crop','cropVal',  function(v){ state.cropSize=v/100; }, function(){ return state.cropSize.toFixed(2); }, false);
+  slider('crop','cropVal',  function(v){ state.cropSize=v/100; }, function(){ return state.cropSize.toFixed(2); }, false, reframe);
   slider('pack','packVal',  function(v){ state.pack=v/100; },     function(){ return state.pack.toFixed(2); }, false);
-  slider('count','countVal',function(v){ state.count=v; },        function(){ return state.count; }, true);
+  slider('count','countVal',function(v){ state.count=v; state.countPref=v; }, function(){ return state.count; }, true);
   slider('size','sizeVal',  function(v){ state.dotR=v; state.dotPref=v; }, function(){ return state.dotR; }, true);
   slider('thread','threadVal',function(v){ state.thread=v/100; }, function(){ return state.thread.toFixed(2); }, false);
   slider('lift','liftVal',  function(v){ state.lift=v/100; },     function(){ return state.lift.toFixed(2); }, false);
@@ -922,7 +1029,7 @@
     var u = (x-L.px)/L.pw, v = (y-L.py)/L.ph;
     if (u<0||u>1||v<0||v>1) return;
 
-    if (state.mode === 'portrait'){ state.cropX = u; state.cropY = v; render(); return; }
+    if (state.mode === 'portrait'){ state.cropX = u; state.cropY = v; reframe(); return; }
 
     var hitR = state.dotR*1.1;
     function near(list){
