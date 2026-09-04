@@ -288,6 +288,7 @@
     background:none;color:var(--dim);font-size:.875rem;font-weight:590;cursor:pointer;white-space:nowrap;
     transition:background .16s,border-color .16s,color .16s,box-shadow .16s;
   }
+  .seg.wrap{grid-auto-flow:row;grid-template-columns:repeat(3,1fr);gap:2px}
   .seg button[aria-pressed=true]{
     border-color:var(--line);background:linear-gradient(180deg,var(--metal-light),var(--metal));color:var(--bone);
     box-shadow:0 2px 6px rgba(0,0,0,.26),inset 0 1px rgba(255,255,255,.055);
@@ -437,6 +438,17 @@
           <div class="head"><label for="thread">Thread strength</label><output id="threadVal" for="thread">0.45</output></div>
           <input type="range" id="thread" min="0" max="100" value="45">
         </div>
+        <div class="ctl">
+          <div class="head"><label>Punch shape</label></div>
+          <div class="seg wrap" id="punchToggle">
+            <button type="button" data-punch="circle" aria-pressed="true">Round</button>
+            <button type="button" data-punch="square" aria-pressed="false">Square</button>
+            <button type="button" data-punch="diamond" aria-pressed="false">Diamond</button>
+            <button type="button" data-punch="hexagon" aria-pressed="false">Hex</button>
+            <button type="button" data-punch="triangle" aria-pressed="false">Triangle</button>
+            <button type="button" data-punch="star" aria-pressed="false">Star</button>
+          </div>
+        </div>
       </section>
 
       <section class="pane" id="panel-paper" role="tabpanel" aria-labelledby="tab-paper" data-pane="paper">
@@ -487,7 +499,7 @@
     auto:[], manual:[],
     count:220, countPref:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
     cropSize:0.46, cropX:0.5, cropY:0.34,
-    shape:'oval', tone:'sepia', edge:'deckle', mode:'portrait',
+    shape:'oval', punch:'circle', tone:'sepia', edge:'deckle', mode:'portrait',
     seed:1, guides:true, layout:null, name:'', subject:'',
     avg:null, avgR:-1
   };
@@ -1132,9 +1144,47 @@
     c.restore();
   }
 
-  function punch(c, L, p){
+  /* ---------- the shape of the die ---------- */
+
+  // Whatever shape the punch is, the hole left in the photograph and the piece
+  // threaded above it are the same cut of paper, so both are drawn from here.
+  // The polygons are grown to hold the same area as the circle they replace,
+  // otherwise switching shape would look like changing the size as well.
+  var DIES = {
+    circle:   { sides:0, turn:0,           grow:1     },
+    square:   { sides:4, turn:Math.PI/4,   grow:1.2533 },
+    diamond:  { sides:4, turn:0,           grow:1.2533 },
+    hexagon:  { sides:6, turn:0,           grow:1.0997 },
+    triangle: { sides:3, turn:-Math.PI/2,  grow:1.30   },
+    star:     { points:5, turn:-Math.PI/2, grow:1.42, waist:0.42 }
+  };
+  function die(){ return DIES[state.punch] || DIES.circle; }
+
+  // Hand-cut, not machine-set: each piece sits a few degrees off true. Taken
+  // from where the hole is, so the hole and its piece always agree without
+  // anything having to be remembered.
+  function punchTurn(u,v){
+    var h = Math.sin(u*127.1 + v*311.7)*43758.5453;
+    return (h - Math.floor(h) - 0.5)*0.5;
+  }
+
+  function punchPath(c, x, y, r, u, v){
+    var d = die();
     c.beginPath();
-    c.arc(L.px+p.u*L.pw, L.py+p.v*L.ph, state.dotR, 0, Math.PI*2);
+    if (!d.sides && !d.points){ c.arc(x, y, r, 0, Math.PI*2); return; }
+    var R = r*d.grow, a0 = d.turn + punchTurn(u,v);
+    var n = d.points ? d.points*2 : d.sides;
+    for (var i=0;i<n;i++){
+      var reach = d.points && (i%2) ? R*d.waist : R;
+      var a = a0 + i*2*Math.PI/n;
+      var px = x + Math.cos(a)*reach, py = y + Math.sin(a)*reach;
+      if (i) c.lineTo(px,py); else c.moveTo(px,py);
+    }
+    c.closePath();
+  }
+
+  function punch(c, L, p){
+    punchPath(c, L.px+p.u*L.pw, L.py+p.v*L.ph, state.dotR, p.u, p.v);
     c.fillStyle = '#FBF8F2'; c.fill();
     c.lineWidth = 1; c.strokeStyle = 'rgba(60,44,34,0.10)'; c.stroke();
   }
@@ -1168,12 +1218,17 @@
   function drawDisc(c, L, p, scale){
     var R = state.dotR*(scale===undefined?1:scale);
     if (R < 0.4) return;
+    // A grown polygon reaches past the circle, so the photograph has to be laid
+    // down over the whole of it or the corners come out empty.
+    var K = die().grow, half = R*K;
     var sw = state.toned.width, sh = state.toned.height;
-    var sr = state.dotR*(sw/L.pw);
+    var sr = state.dotR*(sw/L.pw)*K;
     c.save();
     c.shadowColor = 'rgba(40,28,20,0.16)'; c.shadowBlur = 3; c.shadowOffsetY = 1;
-    c.beginPath(); c.arc(p.tx,p.ty,R,0,Math.PI*2); c.clip();
-    c.drawImage(state.toned, p.u*sw-sr, p.v*sh-sr, sr*2, sr*2, p.tx-R, p.ty-R, R*2, R*2);
+    punchPath(c, p.tx, p.ty, R, p.u, p.v);
+    c.clip();
+    c.drawImage(state.toned, p.u*sw-sr, p.v*sh-sr, sr*2, sr*2,
+                p.tx-half, p.ty-half, half*2, half*2);
     c.restore();
   }
 
@@ -1705,6 +1760,7 @@
   }
   seg('modeToggle','mode');
   seg('shapeToggle','shape');
+  seg('punchToggle','punch');
   seg('edgeToggle','edge');
   seg('toneToggle','tone', function(){ if (state.img) prepareSource(state.img); });
 
