@@ -228,8 +228,9 @@
       <button id="stitch" disabled>Stitch again</button>
       <button id="shuffle" disabled>Repunch</button>
       <button id="save" disabled>Save image</button>
+      <button id="savegif" disabled>Save animation</button>
     </div>
-    <p class="note">The face is found on opening, and the holes are then punched to supply the colours that portrait asks for. On a busy or strongly lit scene it may not find one — tap the head to aim the outline yourself and pull Crop in around it, and the circles will resize to suit.</p>
+    <p class="note">The face is found on opening, and the holes are then punched to supply the colours that portrait asks for. On a busy or strongly lit scene it may not find one — tap the head to aim the outline yourself and pull Crop in around it, and the circles will resize to suit. Saving the animation writes a GIF of the stitching, which takes a few seconds.</p>
   </aside>
 
 </div>
@@ -257,11 +258,11 @@
     count:220, countPref:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
     cropSize:0.46, cropX:0.5, cropY:0.34,
     shape:'oval', tone:'sepia', edge:'deckle', mode:'portrait',
-    seed:1, guides:true, layout:null,
+    seed:1, guides:true, layout:null, name:'',
     avg:null, avgR:-1
   };
 
-  var anim = { raf:0, running:false };
+  var anim = { raf:0, running:false, exporting:false };
 
   function rng(seed){
     var t = seed >>> 0;
@@ -936,6 +937,303 @@
     anim.raf = requestAnimationFrame(frame);
   }
 
+  /* ---------- saving ---------- */
+
+  function slug(s){
+    return String(s||'').replace(/\.[^.]+$/,'').toLowerCase()
+      .replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,28);
+  }
+
+  // Every save used to land as stitched.png, so a second one either collided or
+  // arrived as "stitched (1)". Name them after the photograph and the minute.
+  function saveName(ext){
+    var d = new Date(), p = function(n){ return (n<10?'0':'')+n; };
+    var when = d.getFullYear() + p(d.getMonth()+1) + p(d.getDate()) +
+               '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+    return 'stitched' + (state.name ? '-'+state.name : '') + '-' + when + '.' + ext;
+  }
+
+  function download(blob, name){
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 8000);
+  }
+
+  /* ---------- writing a gif ---------- */
+
+  function Bytes(){ this.buf = new Uint8Array(1<<16); this.n = 0; }
+  Bytes.prototype.need = function(k){
+    if (this.n + k <= this.buf.length) return;
+    var len = this.buf.length;
+    while (len < this.n + k) len *= 2;
+    var nb = new Uint8Array(len);
+    nb.set(this.buf.subarray(0,this.n));
+    this.buf = nb;
+  };
+  Bytes.prototype.u8  = function(v){ this.need(1); this.buf[this.n++] = v & 255; };
+  Bytes.prototype.u16 = function(v){ this.u8(v); this.u8(v>>8); };
+  Bytes.prototype.str = function(s){ for (var i=0;i<s.length;i++) this.u8(s.charCodeAt(i)); };
+  Bytes.prototype.raw = function(a){ this.need(a.length); this.buf.set(a, this.n); this.n += a.length; };
+  Bytes.prototype.done = function(){ return this.buf.subarray(0, this.n); };
+
+  // GIF's variable-width LZW, packed into 255-byte sub-blocks. The prefix table
+  // is four megabytes, so it is built once and re-cleared per frame.
+  var lzwTable = null;
+  function lzw(out, px, minCodeSize){
+    var clear = 1 << minCodeSize, eoi = clear + 1;
+    var codeSize = minCodeSize + 1, next = eoi + 1;
+    var table = lzwTable || (lzwTable = new Int32Array(4096*256));
+    table.fill(-1);
+    var cur = 0, bits = 0, block = new Uint8Array(255), bn = 0;
+
+    function flush(){ if (bn){ out.u8(bn); out.raw(block.subarray(0,bn)); bn = 0; } }
+    function emit(code){
+      cur |= code << bits; bits += codeSize;
+      while (bits >= 8){
+        block[bn++] = cur & 255; cur >>>= 8; bits -= 8;
+        if (bn === 255) flush();
+      }
+    }
+
+    emit(clear);
+    var code = px[0];
+    for (var i=1;i<px.length;i++){
+      var c = px[i], key = code*256 + c, found = table[key];
+      if (found !== -1){ code = found; continue; }
+      emit(code);
+      if (next === 4096){
+        emit(clear);
+        table.fill(-1);
+        next = eoi + 1;
+        codeSize = minCodeSize + 1;
+      } else {
+        if (next >= (1 << codeSize)) codeSize++;
+        table[key] = next++;
+      }
+      code = c;
+    }
+    emit(code); emit(eoi);
+    while (bits > 0){
+      block[bn++] = cur & 255; cur >>>= 8; bits -= 8;
+      if (bn === 255) flush();
+    }
+    flush();
+    out.u8(0);
+  }
+
+  // Median cut: split the colour cloud along its longest axis until there are
+  // enough boxes to go round, then take the average sitting in each.
+  function medianCut(rgb, want){
+    var count = (rgb.length/3)|0, idx = new Uint32Array(count);
+    for (var i=0;i<count;i++) idx[i] = i;
+
+    function box(lo, hi){
+      var rl=255,rh=0,gl=255,gh=0,bl=255,bh=0;
+      for (var i=lo;i<hi;i++){
+        var p = idx[i]*3, r=rgb[p], g=rgb[p+1], b=rgb[p+2];
+        if (r<rl) rl=r;
+        if (r>rh) rh=r;
+        if (g<gl) gl=g;
+        if (g>gh) gh=g;
+        if (b<bl) bl=b;
+        if (b>bh) bh=b;
+      }
+      var dr=rh-rl, dg=gh-gl, db=bh-bl;
+      return { lo:lo, hi:hi, spread:Math.max(dr,dg,db),
+               axis: (dr>=dg && dr>=db) ? 0 : (dg>=db ? 1 : 2) };
+    }
+
+    var boxes = [box(0,count)];
+    while (boxes.length < want){
+      var pick = -1, best = 0;
+      for (var i=0;i<boxes.length;i++){
+        var b = boxes[i];
+        if (b.hi-b.lo < 2 || b.spread <= best) continue;
+        best = b.spread; pick = i;
+      }
+      if (pick < 0) break;
+      var t = boxes[pick], a = t.axis;
+      var part = Array.prototype.slice.call(idx.subarray(t.lo, t.hi));
+      part.sort(function(x,y){ return rgb[x*3+a] - rgb[y*3+a]; });
+      idx.set(part, t.lo);
+      var mid = (t.lo + t.hi) >> 1;
+      boxes.splice(pick, 1, box(t.lo, mid), box(mid, t.hi));
+    }
+
+    return boxes.map(function(b){
+      var r=0,g=0,bb=0, n=b.hi-b.lo;
+      for (var i=b.lo;i<b.hi;i++){ var p=idx[i]*3; r+=rgb[p]; g+=rgb[p+1]; bb+=rgb[p+2]; }
+      return [Math.round(r/n), Math.round(g/n), Math.round(bb/n)];
+    });
+  }
+
+  // Nearest palette entry, cached per 5-bit colour cell so the search runs a few
+  // thousand times rather than a few million.
+  function nearest(pal){
+    var cache = new Int16Array(32768).fill(-1);
+    return function(r,g,b){
+      var k = ((r>>3)<<10) | ((g>>3)<<5) | (b>>3);
+      var v = cache[k];
+      if (v >= 0) return v;
+      var best = 0, bd = 1e12;
+      for (var i=0;i<pal.length;i++){
+        var dr=r-pal[i][0], dg=g-pal[i][1], db=b-pal[i][2];
+        var d = dr*dr*0.299 + dg*dg*0.587 + db*db*0.114;
+        if (d < bd){ bd = d; best = i; }
+      }
+      cache[k] = best;
+      return best;
+    };
+  }
+
+  function gifHead(out, w, h, table){
+    out.str('GIF89a');
+    out.u16(w); out.u16(h);
+    out.u8(0xF7); out.u8(0); out.u8(0);
+    for (var i=0;i<256;i++){
+      var c = table[i] || [0,0,0];
+      out.u8(c[0]); out.u8(c[1]); out.u8(c[2]);
+    }
+    out.u8(0x21); out.u8(0xFF); out.u8(11);
+    out.str('NETSCAPE2.0');
+    out.u8(3); out.u8(1); out.u16(0); out.u8(0);
+  }
+
+  function gifFrame(out, w, h, px, delayCs){
+    out.u8(0x21); out.u8(0xF9); out.u8(4);
+    out.u8(0x05);                        // leave the frame in place, index 0 clear
+    out.u16(delayCs);
+    out.u8(0); out.u8(0);
+    out.u8(0x2C);
+    out.u16(0); out.u16(0); out.u16(w); out.u16(h);
+    out.u8(0); out.u8(8);
+    lzw(out, px, 8);
+  }
+
+  // Re-run the stitching offscreen at a size a phone will put up with, and write
+  // it out frame by frame. Only the pixels that changed since the frame before
+  // are written; the rest are left transparent, which is most of a picture that
+  // is mostly a photograph sitting still.
+  function exportGif(btn){
+    if (!state.toned || anim.exporting) return;
+    var s = scene();
+    if (!s) return;
+    var L = s.L;
+
+    var scale = clamp(Math.min(640/CW, Math.sqrt(560000/(CW*L.CH))), 0.2, 1);
+    var EW = Math.round(CW*scale), EH = Math.round(L.CH*scale);
+    var N = EW*EH;
+
+    function surface(){
+      var c = document.createElement('canvas');
+      c.width = EW; c.height = EH;
+      return c;
+    }
+    var acc = surface(), ac = acc.getContext('2d');
+    var frm = surface(), fc = frm.getContext('2d');
+
+    function scaled(c, fn){ c.save(); c.scale(scale,scale); fn(); c.restore(); }
+
+    function paint(c, pairs){
+      scaled(c, function(){
+        drawPaperAndPhoto(c, L);
+        pairs.forEach(function(p){ punch(c,L,p); });
+        if (state.thread > 0.001) pairs.forEach(function(p){ strokeThread(c,L,p,1,null,1); });
+        pairs.forEach(function(p){ drawDisc(c,L,p,1); });
+      });
+    }
+
+    // the palette comes off the finished picture, plus the red of a live stitch
+    paint(fc, s.pairs);
+    var fin = fc.getImageData(0,0,EW,EH).data;
+    var stride = Math.max(1, Math.floor(N/24000));
+    var samples = new Uint8Array(Math.ceil(N/stride)*3), sn = 0;
+    for (var i=0;i<N;i+=stride){
+      samples[sn++]=fin[i*4]; samples[sn++]=fin[i*4+1]; samples[sn++]=fin[i*4+2];
+    }
+    var pal = medianCut(samples.subarray(0,sn), 250);
+    pal.push([192,57,43], [150,45,34], [232,120,105]);
+    var table = [[0,0,0]].concat(pal);
+    var map = nearest(pal);
+
+    var pairs = s.pairs.slice().sort(function(a,b){ return a.lum-b.lum; });
+    var n = pairs.length, dur = 560, stagger = clamp(6200/n, 7, 46);
+    var span = (n-1)*stagger + dur;
+    var FRAMES = 64, dt = span/FRAMES;
+    var delay = clamp(Math.round(dt/10), 3, 20);
+
+    var out = new Bytes();
+    gifHead(out, EW, EH, table);
+
+    var live = new Uint8Array(N);          // what the viewer is looking at
+    var px = new Uint8Array(N);            // what this frame writes
+    var first = true;
+
+    function encode(delayCs){
+      var d = fc.getImageData(0,0,EW,EH).data;
+      for (var i=0;i<N;i++){
+        var ci = map(d[i*4], d[i*4+1], d[i*4+2]) + 1;
+        px[i] = (!first && live[i] === ci) ? 0 : ci;
+        live[i] = ci;
+      }
+      first = false;
+      gifFrame(out, EW, EH, px, delayCs);
+    }
+
+    ac.save(); ac.scale(scale,scale); drawPaperAndPhoto(ac, L); ac.restore();
+
+    var stitches = pairs.map(function(p,i){ return {p:p, t0:i*stagger}; });
+    var active = [], queued = 0, frame = 0, e = 0;
+
+    anim.exporting = true;
+    btn.disabled = true;
+
+    function chunk(){
+      var until = performance.now() + 30;
+      while (frame < FRAMES){
+        while (queued < n && stitches[queued].t0 <= e){
+          var st = stitches[queued++];
+          scaled(ac, function(){ punch(ac, L, st.p); });
+          active.push(st);
+        }
+        fc.setTransform(1,0,0,1,0,0);
+        fc.clearRect(0,0,EW,EH);
+        fc.drawImage(acc,0,0);
+        scaled(fc, function(){
+          for (var i=active.length-1;i>=0;i--){
+            var a = active[i], t = clamp((e - a.t0)/dur, 0, 1);
+            strokeThread(fc, L, a.p, easeOut(Math.min(1, t/0.72)), 'rgba(192,57,43,0.85)', 1.4);
+            if (t > 0.62){
+              var g = (t-0.62)/0.38;
+              drawDisc(fc, L, a.p, 0.55 + 0.45*easeOut(g) + 0.10*Math.sin(Math.PI*g));
+            }
+            if (t >= 1){
+              scaled(ac, function(){
+                if (state.thread > 0.001) strokeThread(ac, L, a.p, 1, null, 1);
+                drawDisc(ac, L, a.p, 1);
+              });
+              active.splice(i,1);
+            }
+          }
+        });
+        encode(delay);
+        frame++; e += dt;
+        btn.textContent = 'Stitching … ' + Math.round(frame/(FRAMES+1)*100) + '%';
+        if (performance.now() > until){ setTimeout(chunk, 0); return; }
+      }
+      paint(fc, s.pairs);
+      encode(240);                          // and hold on the finished picture
+      out.u8(0x3B);
+      download(new Blob([out.done()], {type:'image/gif'}), saveName('gif'));
+      btn.textContent = 'Save animation';
+      btn.disabled = false;
+      anim.exporting = false;
+    }
+    setTimeout(chunk, 0);
+  }
+
   /* ---------- loading ---------- */
 
   function loadFile(file){
@@ -944,6 +1242,7 @@
     var img = new Image();
     img.onload = function(){
       state.img = img;
+      state.name = slug(file.name);
       prepareSource(img);
       state.manual = [];
       autoCrop();
@@ -951,7 +1250,7 @@
       syncUI();
       generatePoints();
       animate();
-      ['save','shuffle','stitch'].forEach(function(id){
+      ['save','savegif','shuffle','stitch'].forEach(function(id){
         document.getElementById(id).disabled = false;
       });
       URL.revokeObjectURL(url);
@@ -1054,11 +1353,14 @@
   });
   document.getElementById('save').addEventListener('click', function(){
     state.guides = false; render();
-    var a = document.createElement('a');
-    a.download = 'stitched.png';
-    a.href = canvas.toDataURL('image/png');
-    a.click();
-    state.guides = true; render();
+    canvas.toBlob(function(blob){
+      download(blob, saveName('png'));
+      state.guides = true; render();
+    }, 'image/png');
+  });
+
+  document.getElementById('savegif').addEventListener('click', function(){
+    exportGif(this);
   });
 
   document.getElementById('open').addEventListener('click', function(){ fileInput.click(); });
