@@ -257,7 +257,8 @@
     count:220, countPref:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
     cropSize:0.46, cropX:0.5, cropY:0.34,
     shape:'oval', tone:'sepia', edge:'deckle', mode:'portrait',
-    seed:1, guides:true, layout:null
+    seed:1, guides:true, layout:null,
+    avg:null, avgR:-1
   };
 
   var anim = { raf:0, running:false };
@@ -300,6 +301,7 @@
     ac.drawImage(img,0,0,aw,ah);
     state.analysis = ac.getImageData(0,0,aw,ah).data;
     state.aw = aw; state.ah = ah;
+    state.avg = null; state.avgR = -1;
   }
 
   function sampleIndex(u,v){
@@ -311,9 +313,49 @@
     var i = sampleIndex(u,v), d = state.analysis;
     return (0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2])/255;
   }
+  // The colour a circle will actually come out, not the colour of the pixel at
+  // its centre. A punched circle is ten analysis pixels across: match on the
+  // middle one and then draw the hundred around it, and a head of hair or a
+  // beach of shingle reconstructs as mush, because the pixel that was matched
+  // is nothing like the average that gets painted.
   function rgbAt(u,v){
-    var i = sampleIndex(u,v), d = state.analysis;
+    var i = sampleIndex(u,v), d = state.avg || state.analysis;
     return [d[i]/255, d[i+1]/255, d[i+2]/255];
+  }
+
+  function boxBlurRGB(src, aw, ah, r){
+    var n = aw*ah, mid = new Float32Array(n*3), out = new Uint8ClampedArray(n*4);
+    var win = 2*r+1, x, y, a, b, s0, s1, s2, i;
+    for (y=0;y<ah;y++){
+      var row = y*aw;
+      s0=s1=s2=0;
+      for (x=-r;x<=r;x++){ i=(row+clamp(x,0,aw-1))*4; s0+=src[i]; s1+=src[i+1]; s2+=src[i+2]; }
+      for (x=0;x<aw;x++){
+        i=(row+x)*3; mid[i]=s0/win; mid[i+1]=s1/win; mid[i+2]=s2/win;
+        a=(row+clamp(x+r+1,0,aw-1))*4; b=(row+clamp(x-r,0,aw-1))*4;
+        s0+=src[a]-src[b]; s1+=src[a+1]-src[b+1]; s2+=src[a+2]-src[b+2];
+      }
+    }
+    for (x=0;x<aw;x++){
+      s0=s1=s2=0;
+      for (y=-r;y<=r;y++){ i=(clamp(y,0,ah-1)*aw+x)*3; s0+=mid[i]; s1+=mid[i+1]; s2+=mid[i+2]; }
+      for (y=0;y<ah;y++){
+        i=(y*aw+x)*4; out[i]=s0/win; out[i+1]=s1/win; out[i+2]=s2/win; out[i+3]=255;
+        a=(clamp(y+r+1,0,ah-1)*aw+x)*3; b=(clamp(y-r,0,ah-1)*aw+x)*3;
+        s0+=mid[a]-mid[b]; s1+=mid[a+1]-mid[b+1]; s2+=mid[a+2]-mid[b+2];
+      }
+    }
+    return out;
+  }
+
+  // Keep an averaged copy of the photograph at the size of the circles being
+  // cut from it. Rebuilt only when that size changes.
+  function discAverage(){
+    if (!state.analysis) return;
+    var r = clamp(Math.round(state.dotR*state.aw/(CW-MARGIN*2)), 1, 40);
+    if (state.avg && state.avgR === r) return;
+    state.avg = boxBlurRGB(state.analysis, state.aw, state.ah, r);
+    state.avgR = r;
   }
   function detailAt(u,v){
     var s = 1.8/state.aw;
@@ -325,7 +367,7 @@
     var rgb = rgbAt(u,v);
     return {
       r:rgb[0], g:rgb[1], b:rgb[2],
-      lum:lumAt(u,v),
+      lum:0.299*rgb[0] + 0.587*rgb[1] + 0.114*rgb[2],
       detail:detailAt(u,v)
     };
   }
@@ -495,6 +537,7 @@
   }
 
   function generatePoints(){
+    discAverage();
     var m = photoMetrics();
     var rand = rng(state.seed*7919 + state.count*13 + state.dotR);
     var minD = (state.dotR*1.28)/m.pw, aspect = m.ph/m.pw;
@@ -786,6 +829,7 @@
   /* ---------- static render ---------- */
 
   function scene(){
+    discAverage();
     var total = state.auto.length + state.manual.length;
     if (!total) return null;
     var grid = hexSlots(total);
