@@ -62,6 +62,11 @@
   }
   .brand span{font-size:12.5px;color:var(--dim)}
   .lede{margin:0;padding:0 20px 16px;font-size:13.5px;line-height:1.6;color:var(--dim);max-width:56ch}
+  .found{
+    margin:0 20px 16px;padding:9px 12px;font-size:12.5px;line-height:1.5;
+    color:var(--bone);border-left:2px solid var(--thread);
+    background:rgba(237,231,221,.05);max-width:52ch;
+  }
 
   .tabs{display:flex;gap:26px;padding:0 20px;border-bottom:1px solid var(--line)}
   .tabs button{
@@ -155,6 +160,7 @@
       <span>after the punched-photograph embroideries</span>
     </div>
     <p class="lede">Circles are cut out of the photograph and threaded back together above it, rearranged into a small portrait of whoever is in the picture. It finds the face on its own, and cuts the circles it is going to need.</p>
+    <p class="found" id="found" hidden></p>
 
     <nav class="tabs" role="tablist">
       <button role="tab" aria-selected="true" data-tab="portrait">Portrait</button>
@@ -258,7 +264,7 @@
     count:220, countPref:220, dotR:16, dotPref:16, pack:1.0, lift:0.55, thread:0.45,
     cropSize:0.46, cropX:0.5, cropY:0.34,
     shape:'oval', tone:'sepia', edge:'deckle', mode:'portrait',
-    seed:1, guides:true, layout:null, name:'',
+    seed:1, guides:true, layout:null, name:'', subject:'',
     avg:null, avgR:-1
   };
 
@@ -491,21 +497,141 @@
     return best;
   }
 
-  // The crop decides everything downstream, so aim it at the face instead of at
-  // a fixed spot that only suits a tightly framed portrait.
-  function autoCrop(){
-    var box = faceBox();
-    if (!box) return;                      // nothing head-shaped: keep the defaults
-    var aw = state.aw, ah = state.ah;
-    var fw = box.x1-box.x0+1, fh = box.y1-box.y0+1;
+  // Not every photograph has anyone in it. Where there is no face to rebuild,
+  // rebuild whatever is least like the rest of the frame instead: strong colour
+  // away from the average, strong edges. A red bus through a café window, a lit
+  // face in a dark room, a figure at the end of an alley.
+  function salientBox(){
+    var aw = state.aw, ah = state.ah, d = state.analysis;
+    var cell = Math.max(4, Math.round(aw/44));
+    var gw = Math.max(3, Math.floor(aw/cell)), gh = Math.max(3, Math.floor(ah/cell));
+    var N = gw*gh;
+    var cr = new Float32Array(N), cg = new Float32Array(N), cb = new Float32Array(N);
+    var ce = new Float32Array(N), maxE = 1;
 
-    // Open out past the bare skin so hair and jaw come along, but not so far
-    // that the head is lost in the room behind it.
-    var w = clamp(Math.max(fw*1.45, fh*0.93)/aw, 0.10, 0.90);
-    var h = w*1.24*(aw/ah);
-    state.cropSize = w;
-    state.cropX = clamp((box.x0+box.x1)/2/aw, 0, 1);
-    state.cropY = clamp((box.y0+box.y1)/2/ah - h*0.14, 0, 1);
+    for (var j=0;j<gh;j++){
+      for (var i=0;i<gw;i++){
+        var r=0, g=0, b=0, e=0, n=0;
+        for (var y=j*cell; y<(j+1)*cell && y<ah; y++){
+          for (var x=i*cell; x<(i+1)*cell && x<aw; x++){
+            var q = (y*aw+x)*4;
+            r+=d[q]; g+=d[q+1]; b+=d[q+2]; n++;
+            if (x+1<aw && y+1<ah) e += Math.abs(d[q]-d[q+4]) + Math.abs(d[q]-d[q+aw*4]);
+          }
+        }
+        if (!n) continue;
+        var k = j*gw+i;
+        cr[k]=r/n; cg[k]=g/n; cb[k]=b/n; ce[k]=e/n;
+        if (ce[k] > maxE) maxE = ce[k];
+      }
+    }
+
+    function integral(a){
+      var I = new Float64Array((gw+1)*(gh+1));
+      for (var j=0;j<gh;j++){
+        for (var i=0;i<gw;i++){
+          I[(j+1)*(gw+1)+i+1] = a[j*gw+i] + I[j*(gw+1)+i+1] + I[(j+1)*(gw+1)+i] - I[j*(gw+1)+i];
+        }
+      }
+      return I;
+    }
+    function boxMean(I,x,y,w,h){
+      return (I[(y+h)*(gw+1)+x+w] - I[y*(gw+1)+x+w] - I[(y+h)*(gw+1)+x] + I[y*(gw+1)+x]) / (w*h);
+    }
+    function ring(I,i,j,rad){
+      var x0 = clamp(i-rad,0,gw-1), x1 = clamp(i+rad,0,gw-1);
+      var y0 = clamp(j-rad,0,gh-1), y1 = clamp(j+rad,0,gh-1);
+      return boxMean(I, x0, y0, x1-x0+1, y1-y0+1);
+    }
+
+    var Ir = integral(cr), Ig = integral(cg), Ib = integral(cb);
+
+    // Centre-surround, not distance from the average of the whole picture. A
+    // pavement is a big flat slab unlike the average and would win on that
+    // measure every time; what actually draws an eye is a patch unlike the
+    // few inches around it.
+    var sal = new Float32Array(N), total = 0;
+    for (var j=0;j<gh;j++){
+      for (var i=0;i<gw;i++){
+        var k = j*gw+i;
+        var dr = ring(Ir,i,j,1) - ring(Ir,i,j,5);
+        var dg = ring(Ig,i,j,1) - ring(Ig,i,j,5);
+        var db = ring(Ib,i,j,1) - ring(Ib,i,j,5);
+        sal[k] = Math.sqrt(dr*dr+dg*dg+db*db)/255 + (ce[k]/maxE)*0.55;
+        total += sal[k];
+      }
+    }
+    var frameMean = total/N;
+
+    // one pass of smoothing, so a single bright speck cannot carry a window
+    var sm = new Float32Array(N);
+    for (var j=0;j<gh;j++){
+      for (var i=0;i<gw;i++){
+        var sum=0, c=0;
+        for (var v=Math.max(0,j-1); v<=Math.min(gh-1,j+1); v++){
+          for (var u=Math.max(0,i-1); u<=Math.min(gw-1,i+1); u++){ sum+=sal[v*gw+u]; c++; }
+        }
+        sm[j*gw+i] = sum/c;
+      }
+    }
+
+    var Is = integral(sm), best = null;
+    [0.30, 0.42, 0.56].forEach(function(f){
+      var ww = Math.max(2, Math.round(f*gw)), hh = Math.max(2, Math.round(1.24*f*gw));
+      if (ww > gw || hh > gh) return;
+      for (var y=0; y+hh<=gh; y++){
+        for (var x=0; x+ww<=gw; x++){
+          var mean = boxMean(Is,x,y,ww,hh);
+          // a mild pull towards the larger windows, so it frames rather than zooms
+          var score = mean * Math.pow(f, 0.25);
+          if (!best || score > best.score){
+            best = { score:score, mean:mean, size:f, x:(x+ww/2)/gw, y:(y+hh/2)/gh };
+          }
+        }
+      }
+    });
+
+    // An evenly busy picture — a wall, a lawn — has no subject to find. So does
+    // a flat one, where the ratio alone would be comparing nothing to nothing:
+    // real photographs land near 0.35 here.
+    if (!best || best.mean < 0.06 || best.mean < frameMean*1.22) return null;
+    return best;
+  }
+
+  // The crop decides everything downstream, so aim it at the subject instead of
+  // at a fixed spot that only suits a tightly framed portrait.
+  function autoCrop(){
+    var aw = state.aw, ah = state.ah, box = faceBox();
+
+    if (box){
+      var fw = box.x1-box.x0+1, fh = box.y1-box.y0+1;
+      // Open out past the bare skin so hair and jaw come along, but not so far
+      // that the head is lost in the room behind it.
+      var w = clamp(Math.max(fw*1.45, fh*0.93)/aw, 0.10, 0.90);
+      // And a face has to be a real part of the picture to be its subject. Below
+      // that it is a passer-by, a poster on the side of a bus, a reflection —
+      // and the skin test is not to be trusted at that size in any case.
+      if (w >= 0.16){
+        var h = w*1.24*(aw/ah);
+        state.cropSize = w;
+        state.cropX = clamp((box.x0+box.x1)/2/aw, 0, 1);
+        state.cropY = clamp((box.y0+box.y1)/2/ah - h*0.14, 0, 1);
+        state.subject = 'face';
+        return;
+      }
+    }
+
+    var sal = salientBox();
+    if (sal){
+      state.cropSize = sal.size;
+      state.cropX = sal.x;
+      state.cropY = sal.y;
+      state.subject = 'part';
+      return;
+    }
+
+    state.cropSize = 0.9; state.cropX = 0.5; state.cropY = 0.5;
+    state.subject = 'whole';
   }
 
   // The pieces have to be cut from somewhere. Someone standing at the end of a
@@ -1248,6 +1374,7 @@
       autoCrop();
       autoHoleSize();
       syncUI();
+      saySubject();
       generatePoints();
       animate();
       ['save','savegif','shuffle','stitch'].forEach(function(id){
@@ -1267,6 +1394,21 @@
   function fill(el){
     var pct = (el.value - el.min)/(el.max - el.min)*100;
     el.style.setProperty('--p', pct.toFixed(1)+'%');
+  }
+
+  // Say out loud what it decided to rebuild, so an odd choice reads as a choice
+  // rather than a fault, and the reader knows a tap will overrule it.
+  var SUBJECT = {
+    face:  'Found a face, and is rebuilding that.',
+    part:  'No face in this one — rebuilding the part of the picture that stands out most.',
+    whole: 'No face, and nothing much standing out — rebuilding the frame as a whole.',
+    hand:  'Aimed by hand.'
+  };
+  function saySubject(){
+    var el = document.getElementById('found');
+    var msg = SUBJECT[state.subject];
+    el.textContent = msg || '';
+    el.hidden = !msg;
   }
 
   // Push framing chosen for the photograph back onto the controls, so the
@@ -1292,6 +1434,8 @@
   // the pieces have to be re-sized to suit it, exactly as on opening a photo.
   function reframe(){
     if (!state.toned) return;
+    state.subject = 'hand';
+    saySubject();
     autoHoleSize();
     syncUI();
     generatePoints();
